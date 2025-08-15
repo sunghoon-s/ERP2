@@ -1,0 +1,13 @@
+# Node / general
+node_modules/
+.DS_Store
+.vscode/
+
+# OS
+Thumbs.db
+
+# Secrets
+.env
+
+# Office temp
+~$*

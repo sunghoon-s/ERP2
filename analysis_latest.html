@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>생산성 분석</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Malgun Gothic', sans-serif; padding: 20px; background-color: #f9f9f9; }
+        .kpi-cards { display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 20px; }
+        .kpi-card { background: #fff; padding: 15px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); flex: 1; min-width: 150px; text-align: center; }
+        canvas { background: #fff; padding: 10px; border-radius: 8px; margin-top: 20px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; background: #fff; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: center; }
+        th { background: #f4f4f4; }
+        .btn { padding: 10px 20px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        .error { color: red; margin-top: 20px; }
+    </style>
+</head>
+<body>
+<div>
+    <div>
+        <h2>분석 결과</h2>
+    </div>
+    <div id="kpi" class="kpi-cards"></div>
+    <div class="charts">
+        <canvas id="shiftChart"></canvas>
+        <canvas id="bubbleChart"></canvas>
+    </div>
+    <div style="margin-top:20px;">
+        <canvas id="defectChart"></canvas>
+    </div>
+    <button id="downloadBtn" class="btn">CSV 다운로드</button>
+    <div id="summaryTable"></div>
+    <div id="error" class="error" style="display:none;"></div>
+</div>
+
+<script>
+let currentData = null;
+let filteredData = null;
+let idx = {};
+let shiftChartInstance = null;
+let bubbleChartInstance = null;
+let defectChartInstance = null;
+
+function findColumnIndex(headers, keywords) {
+    return headers.findIndex(h => h && keywords.some(k => h.toString().replace(/\s/g,'').toLowerCase().includes(k)));
+}
+
+// ...filtering UI removed: analysis runs on full dataset immediately.
+
+function applyAnalysis() {
+    const rows = (currentData && currentData.rows) ? currentData.rows : [];
+    filteredData = rows;
+    const summary = {
+        totalProd: 0, totalDef: 0, totalWork: 0,
+        effWeighted: 0, totalEffTime: 0,
+        equipSet: new Set(), workerSet: new Set(), shiftData: {}, defectData: {},
+        equipStats: {},
+        shifts: { day: 0, night: 0, three: 0 }
+    };
+    rows.forEach(r => {
+        const prod = +r[idx.prod] || 0;
+        const def = +r[idx.defect] || 0;
+        const work = +r[idx.work] || 0;
+        const eff = +r[idx.eff] || 0;
+        const equip = r[idx.equip] || '미지정';
+        const cat = (r[idx.category] || '').toString();
+        summary.totalProd += prod;
+        summary.totalDef += def;
+        summary.totalWork += work;
+        if (eff && work) { summary.effWeighted += eff * work; summary.totalEffTime += work; }
+    if (equip) summary.equipSet.add(equip);
+    const worker = r[idx.worker];
+    if (worker) summary.workerSet.add(worker);
+    if (!summary.shiftData[equip]) summary.shiftData[equip] = {day:0, night:0, three:0};
+    if (cat.includes('주간')) { summary.shiftData[equip].day += prod; summary.shifts.day += prod; }
+    if (cat.includes('야간')) { summary.shiftData[equip].night += prod; summary.shifts.night += prod; }
+    // 3교대 / 삼교대 variants
+    if (cat.includes('3교대') || cat.includes('삼교대') || cat.includes('3\uad50') ) { summary.shiftData[equip].three += prod; summary.shifts.three += prod; }
+        if (!summary.defectData[equip]) summary.defectData[equip] = 0;
+        summary.defectData[equip] += def;
+        if (!summary.equipStats[equip]) summary.equipStats[equip] = {prod:0, def:0, effSum:0, workSum:0, count:0};
+        summary.equipStats[equip].prod += prod;
+        summary.equipStats[equip].def += def;
+        summary.equipStats[equip].effSum += eff;
+        summary.equipStats[equip].workSum += work;
+        summary.equipStats[equip].count++;
+    });
+    const defectRateAll = summary.totalProd ? (summary.totalDef/summary.totalProd*100) : 0;
+    const defectPpm = summary.totalProd ? Math.round((summary.totalDef / summary.totalProd) * 1000000) : 0;
+    const avgEffAll = summary.totalEffTime ? (summary.effWeighted/summary.totalEffTime) : 0;
+    // UPH: total production divided by total work time (work time assumed in hours)
+    const uphAll = summary.totalWork ? Math.round(summary.totalProd / summary.totalWork) : 0;
+
+    const totalWorkHours = Math.round(summary.totalWork);
+    const uniqueWorkers = summary.workerSet.size;
+
+    document.getElementById('kpi').innerHTML = `
+        <div class="kpi-card"><h3>총 생산량</h3><p>${summary.totalProd.toLocaleString()}</p></div>
+        <div class="kpi-card"><h3>불량률</h3><p>${defectRateAll.toFixed(2)}% (${defectPpm.toLocaleString()} ppm)</p></div>
+        <div class="kpi-card"><h3>총 UPH</h3><p>${uphAll.toLocaleString()} /hr</p></div>
+        <div class="kpi-card"><h3>총 작업시간</h3><p>${totalWorkHours.toLocaleString()} 시간</p></div>
+        <div class="kpi-card"><h3>투입인원 (고유)</h3><p>${uniqueWorkers.toLocaleString()} 명</p></div>
+        <div class="kpi-card"><h3>설비 수</h3><p>${summary.equipSet.size}</p></div>
+    `;
+    drawShiftChart(summary.shiftData);
+    drawBarChart(rows);
+    drawDefectChart(summary.defectData);
+    renderSummaryTable(summary.equipStats);
+}
+
+function drawShiftChart(data) {
+    if (shiftChartInstance) shiftChartInstance.destroy();
+    shiftChartInstance = new Chart(document.getElementById('shiftChart'), {
+        type: 'bar',
+        data: {
+            labels: Object.keys(data),
+            datasets: [
+                { label: '주간', data: Object.values(data).map(v => v.day), backgroundColor: 'rgba(54, 162, 235, 0.6)' },
+                { label: '야간', data: Object.values(data).map(v => v.night), backgroundColor: 'rgba(255, 99, 132, 0.6)' }
+            ]
+        },
+        options: { responsive: true, plugins: { title: { display: true, text: '설비별 주·야간 생산성' } } }
+    });
+}
+
+function drawBarChart(rows) {
+    if (bubbleChartInstance) bubbleChartInstance.destroy();
+    const equipData = {};
+    rows.forEach(r => {
+        const equip = r[idx.equip] || '미지정';
+        const eff = +r[idx.eff] || 0;
+        const prod = +r[idx.prod] || 0;
+        if (!equipData[equip]) equipData[equip] = {effSum:0, prodSum:0, count:0};
+        equipData[equip].effSum += eff;
+        equipData[equip].prodSum += prod;
+        equipData[equip].count++;
+    });
+    const labels = Object.keys(equipData);
+    const avgEff = labels.map(e => (equipData[e].effSum / equipData[e].count).toFixed(2));
+    const prodVals = labels.map(e => equipData[e].prodSum);
+
+    bubbleChartInstance = new Chart(document.getElementById('bubbleChart'), {
+        type: 'bar',
+        data: {
+            labels: labels,
+            datasets: [
+                {
+                    label: '평균 효율(%)',
+                    data: avgEff,
+                    backgroundColor: 'rgba(54, 162, 235, 0.6)',
+                    yAxisID: 'y'
+                },
+                {
+                    label: '생산량',
+                    data: prodVals,
+                    backgroundColor: 'rgba(255, 206, 86, 0.6)',
+                    yAxisID: 'y1'
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            plugins: { title: { display: true, text: '설비별 평균 효율 & 생산량' } },
+            scales: {
+                y: { type: 'linear', position: 'left', title: { display: true, text: '평균 효율(%)' } },
+                y1: { type: 'linear', position: 'right', title: { display: true, text: '생산량' }, grid: { drawOnChartArea: false } }
+            }
+        }
+    });
+}
+
+function drawDefectChart(defectData) {
+    if (defectChartInstance) defectChartInstance.destroy();
+    const sorted = Object.entries(defectData).sort((a,b) => b[1]-a[1]).slice(0,5);
+    defectChartInstance = new Chart(document.getElementById('defectChart'), {
+        type: 'bar',
+        data: { labels: sorted.map(d => d[0]), datasets: [{ label: '불량 수량', data: sorted.map(d => d[1]), backgroundColor: 'rgba(255, 159, 64, 0.6)' }] },
+        options: { responsive: true, indexAxis: 'y', plugins: { title: { display: true, text: '불량 상위 5개 설비' } } }
+    });
+}
+
+function renderSummaryTable(equipStats) {
+    let html = `<table><tr><th>설비</th><th>생산량</th><th>불량률</th><th>평균효율</th></tr>`;
+    Object.keys(equipStats).forEach(equip => {
+        const st = equipStats[equip];
+        const defectRate = st.prod ? (st.def / st.prod * 100) : 0;
+        const avgEff = st.count ? (st.effSum / st.count) : 0;
+        html += `<tr>
+            <td>${equip}</td>
+            <td>${st.prod.toLocaleString()}</td>
+            <td>${defectRate.toFixed(2)}%</td>
+            <td>${avgEff.toFixed(2)}%</td>
+        </tr>`;
+    });
+    html += `</table>`;
+    document.getElementById('summaryTable').innerHTML = html;
+}
+
+function downloadCSV() {
+    if (!filteredData) return;
+    const rows = [currentData.headers, ...filteredData];
+    const csvContent = "\uFEFF" + rows.map(e => e.map(c => `"${c??''}"`).join(",")).join("\n");
+    const blob = new Blob([csvContent], {type: "text/csv;charset=utf-8;"});
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.setAttribute("download", "analysis_result.csv");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('downloadBtn').addEventListener('click', downloadCSV);
+    const params = new URLSearchParams(location.search);
+    const id = params.get('id');
+    if (id) {
+        const stored = sessionStorage.getItem('analysisData_' + id);
+        if (stored) {
+            currentData = JSON.parse(stored);
+            idx = {
+                prod: findColumnIndex(currentData.headers, ['생산수량']),
+                defect: findColumnIndex(currentData.headers, ['불량수량']),
+                work: findColumnIndex(currentData.headers, ['작업시간']),
+                eff: findColumnIndex(currentData.headers, ['효율2']),
+                equip: findColumnIndex(currentData.headers, ['설비']),
+                worker: findColumnIndex(currentData.headers, ['작업자']),
+                category: findColumnIndex(currentData.headers, ['구분']),
+                date: findColumnIndex(currentData.headers, ['생산일자','날짜'])
+            };
+            // Run analysis on full dataset immediately
+            applyAnalysis();
+        } else {
+            document.getElementById('error').textContent = '세션 데이터가 없습니다.';
+            document.getElementById('error').style.display = 'block';
+        }
+    }
+});
+</script>
+</body>
+</html>
